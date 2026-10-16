@@ -77,7 +77,7 @@ except ImportError:  # pragma: no cover
     sys.exit("This script needs the 'requests' package:  pip install requests")
 
 LOG = logging.getLogger("asm_upgrade_diff")
-CHUNK_SIZE = 1024 * 1024  # ASM file-transfer endpoint serves at most 1 MB per request
+CHUNK_SIZE = 512 * 1024  # bytes per file-transfer request (endpoint maximum is 1 MB)
 
 # Built-in noise rules: fields that change on every export or every upgrade and
 # are not policy content. Same syntax as --noise (see module docstring).
@@ -245,15 +245,70 @@ class BigIP:
 
     def list_policies(self):
         data = self.get_json("/mgmt/tm/asm/policies",
-                             params={"$select": "id,name,fullPath,type,active,enforcementMode"})
+                             params={"$select": "id,name,fullPath,type,active,enforcementMode,virtualServers"})
         return data.get("items", [])
 
+    # -- virtual server -> ASM policy bindings --------------------------------
+    @staticmethod
+    def _link_path(link):
+        """https://localhost/mgmt/tm/...?ver=x  ->  /mgmt/tm/...?ver=x"""
+        return re.sub(r"^https?://[^/]+", "", link)
+
+    def _subcollection(self, ref):
+        """Items of an expanded subcollection reference, fetching it if not expanded."""
+        if not ref:
+            return []
+        if "items" in ref:
+            return ref["items"] or []
+        if ref.get("link"):
+            return self.get_json(self._link_path(ref["link"])).get("items", [])
+        return []
+
+    def get_vs_bindings(self, asm_policies):
+        """Return one record per virtual server with the ASM policies attached to it.
+
+        Two sources are combined:
+          * LTM policies attached to the VS whose rules have an 'asm enable policy X' action
+          * the ASM policy object's own virtualServers list
+        """
+        ltm_to_asm = {}
+        for lp in self.get_json("/mgmt/tm/ltm/policy",
+                                params={"expandSubcollections": "true"}).get("items", []):
+            found = set()
+            for rule in self._subcollection(lp.get("rulesReference")):
+                for act in self._subcollection(rule.get("actionsReference")):
+                    if act.get("asm") and act.get("enable") and act.get("policy"):
+                        found.add(act["policy"])
+            ltm_to_asm[lp.get("fullPath")] = found
+
+        via_asm = defaultdict(set)
+        for p in asm_policies:
+            for vs in p.get("virtualServers") or []:
+                via_asm[vs].add(p.get("fullPath"))
+
+        out = []
+        for vs in self.get_json("/mgmt/tm/ltm/virtual",
+                                params={"expandSubcollections": "true"}).get("items", []):
+            full = vs.get("fullPath") or f"/{vs.get('partition', 'Common')}/{vs['name']}"
+            lps = sorted(i.get("fullPath") or f"/{i.get('partition', 'Common')}/{i['name']}"
+                         for i in self._subcollection(vs.get("policiesReference")))
+            via_ltm = set()
+            for lp in lps:
+                via_ltm |= ltm_to_asm.get(lp, set())
+            out.append({
+                "virtual": full,
+                "destination": vs.get("destination", ""),
+                "enabled": not vs.get("disabled", False),
+                "ltm_policies": lps,
+                "asm_via_ltm": sorted(via_ltm),
+                "asm_via_asm": sorted(via_asm.get(full, ())),
+                "asm_policies": sorted(via_ltm | via_asm.get(full, set())),
+            })
+        return sorted(out, key=lambda v: v["virtual"])
+
     # -- export -------------------------------------------------------------
-    def export_policy(self, policy_id, remote_name, dest, fmt="xml", poll_timeout=600):
-        body = {"filename": remote_name,
-                "policyReference": {"link": f"https://localhost/mgmt/tm/asm/policies/{policy_id}"}}
-        if fmt == "json":
-            body["format"] = "json"
+    def _run_export_task(self, body, poll_timeout):
+        """Start an export-policy task, wait for it, and return the completed task."""
         task = self.request("POST", "/mgmt/tm/asm/tasks/export-policy", json=body).json()
         task_id = task["id"]
         task_path = f"/mgmt/tm/asm/tasks/export-policy/{task_id}"
@@ -271,32 +326,96 @@ class BigIP:
                 raise BigIPError(f"export task {task_id} timed out (last status {status!r})")
             time.sleep(delay)
             delay = min(delay * 1.5, 5)
-        self.download(remote_name, dest)
-        try:  # tidy up the task record; the file itself stays in /var/ts/var/rest
+        try:  # tidy up the task record
             self.request("DELETE", task_path, retry_auth=False)
         except BigIPError:
             pass
+        return t
+
+    def export_policy(self, policy_id, remote_name, dest, fmt="xml", poll_timeout=600, retries=3):
+        """Export one policy to `dest`, verified complete and well-formed.
+
+        Tries the file export + chunked download up to `retries` times, then falls back to
+        an inline export (policy returned in the task result). Returns a dict of details
+        for the manifest; raises BigIPError if every attempt fails.
+        """
+        body = {"filename": remote_name,
+                "policyReference": {"link": f"https://localhost/mgmt/tm/asm/policies/{policy_id}"}}
+        if fmt == "json":
+            body["format"] = "json"
+        history = []
+
+        for attempt in range(1, retries + 1):
+            try:
+                self._run_export_task(body, poll_timeout)
+                received, total = self.download(remote_name, dest)
+                validate_export(dest)
+                return {"method": "file", "bytes": received, "attempts": attempt, "notes": history}
+            except (BigIPError, ValueError) as e:
+                history.append(f"file export attempt {attempt}: {e}")
+                LOG.warning("%s: %s: %s", self.host, remote_name, history[-1])
+                if Path(dest).exists():
+                    Path(dest).replace(str(dest) + ".invalid")  # keep for troubleshooting
+
+        try:
+            t = self._run_export_task({**body, "inline": True}, poll_timeout)
+            content = (t.get("result") or {}).get("file")
+            if not content:
+                raise BigIPError("inline export returned no content")
+            Path(dest).write_bytes(content.encode("utf-8") if isinstance(content, str)
+                                   else json.dumps(content).encode("utf-8"))
+            validate_export(dest)
+            history.append("recovered with inline export")
+            LOG.info("%s: %s: recovered with inline export", self.host, remote_name)
+            return {"method": "inline", "bytes": Path(dest).stat().st_size,
+                    "attempts": retries + 1, "notes": history}
+        except (BigIPError, ValueError) as e:
+            history.append(f"inline export: {e}")
+            if Path(dest).exists():
+                Path(dest).replace(str(dest) + ".invalid")
+            raise BigIPError("; ".join(history)) from e
 
     def download(self, remote_name, dest):
-        """Chunked download from /mgmt/tm/asm/file-transfer/downloads/."""
+        """Chunked download from /mgmt/tm/asm/file-transfer/downloads/.
+
+        Advances by the bytes actually received (not by what Content-Range claims),
+        never requests past the end of the file, and fails if the final size doesn't
+        match the total the BIG-IP reported. Returns (bytes received, expected total).
+        """
         path = f"/mgmt/tm/asm/file-transfer/downloads/{remote_name}"
         tmp = Path(str(dest) + ".part")
-        start, total = 0, 0
+        received, total = 0, None
         with open(tmp, "wb") as fh:
             while True:
-                end = start + CHUNK_SIZE - 1
+                end = received + CHUNK_SIZE - 1
+                if total is not None:
+                    end = min(end, total - 1)
                 headers = {"Content-Type": "application/octet-stream",
-                           "Content-Range": f"{start}-{end}/{total}"}
+                           "Content-Range": f"{received}-{end}/{total or 0}"}
                 r = self.request("GET", path, headers=headers)
-                fh.write(r.content)
-                m = re.match(r"\s*(\d+)-(\d+)/(\d+)", r.headers.get("Content-Range", ""))
+                data = r.content
+                m = re.match(r"\s*(?:bytes\s+)?(\d+)-(\d+)/(\d+)", r.headers.get("Content-Range", ""))
+                if m:
+                    rstart, _, rtotal = map(int, m.groups())
+                    if rstart != received:
+                        raise BigIPError(f"server sent range starting at byte {rstart}, "
+                                         f"expected {received}")
+                    total = rtotal if total is None else total
+                fh.write(data)
+                received += len(data)
                 if not m:
-                    break  # whole file came back in one response
-                _, rend, total = map(int, m.groups())
-                if rend + 1 >= total:
+                    if total is None:  # whole file came back in a single response
+                        total = received
                     break
-                start = rend + 1
+                if received >= total:
+                    break
+                if not data:
+                    raise BigIPError(f"download stalled at {received} of {total} bytes")
+        if total is not None and received != total:
+            tmp.unlink(missing_ok=True)
+            raise BigIPError(f"incomplete download: got {received} of {total} bytes")
         tmp.replace(dest)
+        return received, total
 
 
 # --------------------------------------------------------------------------- #
@@ -312,6 +431,21 @@ def sha256(path):
         for block in iter(lambda: fh.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def validate_export(path):
+    """Raise ValueError if an exported policy file is empty, truncated, or malformed."""
+    p = Path(path)
+    size = p.stat().st_size
+    if size == 0:
+        raise ValueError("export file is empty")
+    try:
+        if p.suffix == ".json":
+            json.loads(p.read_bytes())
+        else:
+            ET.parse(p)
+    except (ET.ParseError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ValueError(f"export is not well-formed ({size} bytes): {e}") from e
 
 
 def now_iso():
@@ -371,6 +505,14 @@ def export_device(host, args, password):
             policies = sorted(bip.list_policies(), key=lambda p: p.get("fullPath", ""))
             manifest["policy_count"] = len(policies)
             LOG.info("%s: %d ASM policies found", host, len(policies))
+            try:
+                manifest["virtual_servers"] = bip.get_vs_bindings(policies)
+                bound = sum(1 for v in manifest["virtual_servers"] if v["asm_policies"])
+                LOG.info("%s: %d virtual servers, %d with an ASM policy attached",
+                         host, len(manifest["virtual_servers"]), bound)
+            except (BigIPError, KeyError, ValueError) as e:
+                manifest["errors"].append(f"virtual server bindings: {e}")
+                LOG.error("%s: could not read virtual server bindings: %s", host, e)
             for i, p in enumerate(policies, 1):
                 full = p.get("fullPath") or p.get("name")
                 entry = {k: p.get(k) for k in ("id", "name", "fullPath", "type",
@@ -380,10 +522,12 @@ def export_device(host, args, password):
                 remote = f"asmdiff_{args.phase}_{p['id']}.{ext}"
                 try:
                     LOG.info("%s: [%d/%d] exporting %s", host, i, len(policies), full)
-                    bip.export_policy(p["id"], remote, local, fmt=args.format,
-                                      poll_timeout=args.task_timeout)
+                    info = bip.export_policy(p["id"], remote, local, fmt=args.format,
+                                             poll_timeout=args.task_timeout)
                     entry["file"] = str(local.relative_to(devdir))
                     entry["sha256"] = sha256(local)
+                    entry.update(bytes=info["bytes"], export_method=info["method"],
+                                 export_notes=info["notes"])
                 except BigIPError as e:
                     entry["error"] = str(e)
                     manifest["errors"].append(f"{full}: {e}")
@@ -422,8 +566,10 @@ def cmd_export(args):
             print(f"  {h:<30} FAILED (see log)")
         else:
             ok = sum(1 for p in m["policies"] if p["file"])
+            bound = sum(1 for v in m.get("virtual_servers", []) if v["asm_policies"])
             print(f"  {h:<30} {fmt_version(m['version']):<28} "
-                  f"{ok}/{m['policy_count'] or 0} policies exported"
+                  f"{ok}/{m['policy_count'] or 0} policies exported, "
+                  f"{bound} protected virtual servers"
                   + (f", {len(m['errors'])} error(s)" if m["errors"] else ""))
 
     if args.phase == "post" and not args.no_report:
@@ -525,13 +671,20 @@ def canonicalize(path, opts):
 
 
 def compare_policy(pre_path, post_path, opts):
+    problems = []
+    for label, p in (("pre-upgrade", pre_path), ("post-upgrade", post_path)):
+        try:
+            validate_export(p)
+        except (ValueError, OSError) as e:
+            problems.append(f"{label} file {Path(p).name}: {e}")
+    if problems:
+        return {"status": "error",
+                "error": "; ".join(problems) + ". The file is truncated or corrupt; re-export that "
+                         "phase with --force (the script now verifies downloads)."}
     if sha256(pre_path) == sha256(post_path):
         return {"status": "identical"}
-    try:
-        pre_lines, pre_sec = canonicalize(pre_path, opts)
-        post_lines, post_sec = canonicalize(post_path, opts)
-    except (ET.ParseError, json.JSONDecodeError) as e:
-        return {"status": "error", "error": f"could not parse export: {e}"}
+    pre_lines, pre_sec = canonicalize(pre_path, opts)
+    post_lines, post_sec = canonicalize(post_path, opts)
     if pre_lines == post_lines:
         return {"status": "cosmetic"}
     diff = list(difflib.unified_diff(pre_lines, post_lines, "pre-upgrade",
@@ -557,6 +710,57 @@ STATUS_LABEL = {
 }
 
 
+VS_LABEL = {
+    "match": ("Same policy", "ok"),
+    "changed": ("Policy changed", "bad"),
+    "removed": ("Policy detached", "bad"),
+    "added": ("Policy attached after upgrade", "warn"),
+    "vs_missing": ("Virtual server missing", "bad"),
+    "vs_new": ("New virtual server", "warn"),
+}
+
+
+def compare_vs(pre_vs, post_vs, post_policy_names):
+    """Compare VS -> ASM policy bindings. Returns (rows, count of VSs with no policy either time)."""
+    pre_m = {v["virtual"]: v for v in pre_vs}
+    post_m = {v["virtual"]: v for v in post_vs}
+    rows, unbound = [], 0
+    for name in sorted(set(pre_m) | set(post_m)):
+        a, b = pre_m.get(name), post_m.get(name)
+        pa = a["asm_policies"] if a else []
+        pb = b["asm_policies"] if b else []
+        if not pa and not pb:
+            unbound += 1
+            continue
+        if a and not b:
+            status = "vs_missing"
+        elif b and not a:
+            status = "vs_new"
+        elif pa == pb:
+            status = "match"
+        elif pa and not pb:
+            status = "removed"
+        elif pb and not pa:
+            status = "added"
+        else:
+            status = "changed"
+        notes = []
+        if a and b and a.get("enabled") != b.get("enabled"):
+            state = lambda x: "enabled" if x.get("enabled") else "disabled"  # noqa: E731
+            notes.append(f"VS {state(a)} before, {state(b)} after")
+        gone = [p for p in pb if p not in post_policy_names]
+        if gone:
+            notes.append("attached policy not in post-upgrade policy list: " + ", ".join(gone))
+        if b and b.get("asm_via_ltm") != b.get("asm_via_asm"):
+            notes.append(f"post: LTM policy says {b.get('asm_via_ltm') or 'none'}, "
+                         f"ASM policy says {b.get('asm_via_asm') or 'none'}")
+        rows.append({"virtual": name, "status": status, "pre": pa, "post": pb,
+                     "ltm_pre": a.get("ltm_policies", []) if a else [],
+                     "ltm_post": b.get("ltm_policies", []) if b else [],
+                     "notes": notes})
+    return rows, unbound
+
+
 def load_manifest(devdir, phase):
     p = devdir / phase / "manifest.json"
     return json.loads(p.read_text()) if p.exists() else None
@@ -570,7 +774,8 @@ def build_results(outdir, opts):
             continue
         dev = {"key": devdir.name, "host": (pre or post)["host"],
                "hostname": (post or pre).get("hostname", ""),
-               "pre": pre, "post": post, "policies": [], "notes": []}
+               "pre": pre, "post": post, "policies": [], "notes": [],
+               "vs_rows": [], "vs_checked": False, "vs_issues": 0, "vs_unbound": 0}
         devices.append(dev)
         if not pre or not post:
             dev["notes"].append(f"No {'pre' if not pre else 'post'}-upgrade snapshot yet.")
@@ -609,12 +814,24 @@ def build_results(outdir, opts):
             "missing_post" not in st and "new_post" not in st
         dev["material"] = st.count("material")
         dev["errors"] = st.count("error")
+
+        if "virtual_servers" in pre and "virtual_servers" in post:
+            rows, unbound = compare_vs(pre["virtual_servers"], post["virtual_servers"], set(post_pols))
+            for r in rows:
+                r["anchor"] = f"vs-{safe_name(devdir.name)}--{safe_name(r['virtual'])}"
+            dev.update(vs_rows=rows, vs_checked=True, vs_unbound=unbound,
+                       vs_issues=sum(1 for r in rows if r["status"] != "match"))
+        else:
+            dev["notes"].append("Virtual server bindings were not collected in the "
+                                f"{'pre' if 'virtual_servers' not in pre else 'post'}-upgrade "
+                                "snapshot, so the binding check was skipped.")
     return devices
 
 
 def device_ok(d):
     return bool(d["pre"] and d["post"] and d.get("count_match")
                 and not d.get("material") and not d.get("errors")
+                and d.get("vs_checked") and not d.get("vs_issues")
                 and not d["pre"].get("errors") and not d["post"].get("errors"))
 
 
@@ -680,6 +897,8 @@ def write_report(devices, outdir, opts):
     n_material = sum(d["material"] for d in complete)
     n_errors = sum(d["errors"] for d in complete) + \
         sum(1 for d in devices if any(m and m.get("errors") for m in (d["pre"], d["post"])))
+    n_vs_issues = sum(d["vs_issues"] for d in complete)
+    n_vs_checked = sum(len(d["vs_rows"]) for d in complete)
     all_ok = devices and all(device_ok(d) for d in devices)
 
     h = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
@@ -689,31 +908,43 @@ def write_report(devices, outdir, opts):
          f"<div class='muted'>Generated {e(now_iso())} from <code>{e(str(Path(outdir).resolve()))}</code></div>"]
 
     # ---- overall summary ----
-    verdict = ("All devices: policy counts match and no material policy differences."
-               if all_ok else "Attention needed: see the flagged items below.")
+    verdict = ("All devices: policy counts match, no material policy differences, and every "
+               "virtual server keeps the same ASM policy." if all_ok
+               else "Attention needed: see the flagged items below.")
     h.append(f"<div class='card'><div class='banner'>{pill('PASS' if all_ok else 'REVIEW', 'ok' if all_ok else 'bad')} "
              f"{e(verdict)}</div><div class='tiles'>"
              f"<div class='tile'><b>{len(complete)}/{len(devices)}</b>devices with pre + post data</div>"
              f"<div class='tile'><b>{n_mismatch}</b>devices with policy count mismatch</div>"
              f"<div class='tile'><b>{n_material}</b>policies with material differences</div>"
+             f"<div class='tile'><b>{n_vs_issues}</b>of {n_vs_checked} protected virtual servers "
+             f"with binding changes</div>"
              f"<div class='tile'><b>{n_errors}</b>export / parse errors</div></div></div>")
 
     # ---- device summary table ----
     h.append("<h2>Device summary</h2><div class='card wrap'><table><tr><th>Device</th><th>Version before → after</th>"
-             "<th>Policies before / after</th><th>Count</th><th>Material diffs</th><th>Status</th></tr>")
+             "<th>Policies before / after</th><th>Count</th><th>Material diffs</th><th>VS bindings</th>"
+             "<th>Status</th></tr>")
     for d in devices:
         pre_v = fmt_version(d["pre"]["version"]) if d["pre"] else "—"
         post_v = fmt_version(d["post"]["version"]) if d["post"] else "—"
         name = e(d["host"]) + (f"<div class='muted'>{e(d['hostname'])}</div>" if d["hostname"] else "")
         if not (d["pre"] and d["post"]):
             h.append(f"<tr><td><a href='#dev-{e(d['key'])}'>{name}</a></td><td>{e(pre_v)} → {e(post_v)}</td>"
-                     f"<td>—</td><td>—</td><td>—</td><td>{pill('Incomplete', 'warn')}</td></tr>")
+                     f"<td>—</td><td>—</td><td>—</td><td>—</td><td>{pill('Incomplete', 'warn')}</td></tr>")
             continue
         count = pill("Match", "ok") if d["count_match"] else pill("Mismatch", "bad")
         mat = d["material"]
         mat_html = (f"<a href='#dev-{e(d['key'])}'>{mat}</a>" if mat else "0")
+        if not d["vs_checked"]:
+            vs_html = pill("Not checked", "warn")
+        elif d["vs_issues"]:
+            label = f"{d['vs_issues']} changed"
+            vs_html = f"<a href='#vs-{e(d['key'])}'>{pill(label, 'bad')}</a>"
+        else:
+            label = f"Match ({len(d['vs_rows'])})"
+            vs_html = pill(label, "ok")
         h.append(f"<tr><td><a href='#dev-{e(d['key'])}'>{name}</a></td><td>{e(pre_v)} → {e(post_v)}</td>"
-                 f"<td>{d['pre_count']} / {d['post_count']}</td><td>{count}</td><td>{mat_html}</td>"
+                 f"<td>{d['pre_count']} / {d['post_count']}</td><td>{count}</td><td>{mat_html}</td><td>{vs_html}</td>"
                  f"<td>{pill('OK', 'ok') if device_ok(d) else pill('Review', 'bad')}</td></tr>")
     h.append("</table></div>")
 
@@ -728,6 +959,18 @@ def write_report(devices, outdir, opts):
             secs = ", ".join(r.get("sections", [])[:8]) + (" …" if len(r.get("sections", [])) > 8 else "")
             h.append(f"<tr><td>{e(d['host'])}</td><td><a href='#{e(r['anchor'])}'>{e(r['name'])}</a></td>"
                      f"<td>{pill(lbl, cls)}</td><td><code>{e(secs)}</code></td></tr>")
+        h.append("</table></div>")
+
+    vs_flagged = [(d, r) for d in devices for r in d["vs_rows"] if r["status"] != "match"]
+    if vs_flagged:
+        h.append("<h2>Virtual server bindings needing review</h2><div class='card wrap'><table>"
+                 "<tr><th>Device</th><th>Virtual server</th><th>Result</th>"
+                 "<th>ASM policy before</th><th>ASM policy after</th></tr>")
+        for d, r in vs_flagged:
+            lbl, cls = VS_LABEL[r["status"]]
+            h.append(f"<tr><td>{e(d['host'])}</td><td><a href='#{e(r['anchor'])}'>{e(r['virtual'])}</a></td>"
+                     f"<td>{pill(lbl, cls)}</td><td><code>{e(', '.join(r['pre']) or '—')}</code></td>"
+                     f"<td><code>{e(', '.join(r['post']) or '—')}</code></td></tr>")
         h.append("</table></div>")
 
     # ---- per-device detail ----
@@ -751,6 +994,23 @@ def write_report(devices, outdir, opts):
                 pm = f"+{r['added']} / −{r['removed']}" if r["status"] == "material" else ""
                 h.append(f"<tr><td>{name}</td><td>{pill(lbl, cls)}</td><td>{pm}</td></tr>")
             h.append("</table></div>")
+        if d["vs_checked"]:
+            h.append(f"<h3 id='vs-{e(d['key'])}'>Virtual server → ASM policy bindings</h3>"
+                     f"<div class='muted'>{len(d['vs_rows'])} virtual servers with an ASM policy "
+                     f"before or after; {d['vs_unbound']} without one in either snapshot (not listed).</div>")
+            if d["vs_rows"]:
+                h.append("<div class='wrap'><table><tr><th>Virtual server</th><th>Result</th>"
+                         "<th>ASM policy before → after</th><th>LTM policies after</th><th>Notes</th></tr>")
+                for r in d["vs_rows"]:
+                    lbl, cls = VS_LABEL[r["status"]]
+                    before = ", ".join(r["pre"]) or "—"
+                    after = ", ".join(r["post"]) or "—"
+                    pol_html = (f"<code>{e(before)}</code>" if r["status"] == "match"
+                                else f"<code>{e(before)}</code> → <code>{e(after)}</code>")
+                    h.append(f"<tr id='{e(r['anchor'])}'><td>{e(r['virtual'])}</td><td>{pill(lbl, cls)}</td>"
+                             f"<td>{pol_html}</td><td><code>{e(', '.join(r['ltm_post']) or '—')}</code></td>"
+                             f"<td>{'<br>'.join(e(n) for n in r['notes'])}</td></tr>")
+                h.append("</table></div>")
         for r in d["policies"]:
             if r["status"] == "error":
                 h.append(f"<details open id='{e(r['anchor'])}'><summary>{e(r['name'])} — error</summary>"
@@ -791,6 +1051,8 @@ def write_report(devices, outdir, opts):
          "version_pre": d["pre"] and d["pre"]["version"], "version_post": d["post"] and d["post"]["version"],
          "policy_count_pre": d.get("pre_count"), "policy_count_post": d.get("post_count"),
          "count_match": d.get("count_match"), "ok": device_ok(d), "notes": d["notes"],
+         "vs_binding_checked": d["vs_checked"], "vs_binding_issues": d["vs_issues"],
+         "virtual_servers": [{k: v for k, v in r.items() if k != "anchor"} for r in d["vs_rows"]],
          "policies": [{k: v for k, v in r.items() if k not in ("diff", "anchor")} for r in d["policies"]]}
         for d in devices]}
     (Path(outdir) / "report.json").write_text(json.dumps(summary, indent=2))

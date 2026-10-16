@@ -1,3 +1,2 @@
 # One BIG-IP IP or hostname per line; '#' comments allowed
-10.1.1.245
 botpot.protea.dev
