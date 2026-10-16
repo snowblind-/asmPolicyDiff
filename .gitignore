@@ -1,0 +1,9 @@
+# Policy exports and reports (may contain sensitive config)
+asm_snapshots/
+*.part
+report.html
+report.json
+
+
+
+

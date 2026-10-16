@@ -1,0 +1,31 @@
+# Noise filter for asm_upgrade_diff.py
+# Usage:  ./asm_upgrade_diff.py report --noise-file noise-filter.txt
+#   (also accepted by: export --phase post --noise-file ...)
+#
+# These rules are added to the built-in ones (timestamps, bigip_version,
+# integrity_check, ...). Pass --no-default-noise to use only this file.
+#
+# One rule per line. Blank lines and '#' comments are ignored; a ' #' after a
+# rule starts an inline comment (except on re: lines).
+# '*' and '?' wildcards work in every rule except re: rules.
+#
+#   name                 element (XML) / key (JSON) with this name, anywhere
+#   parent/child         element at this path below the policy root
+#   @attr                attribute with this name on any element
+#   element@attr         attribute only on that element (name or path)
+#   re:<regex>           drop normalized diff lines matching the regex
+#
+# Uncomment what applies to your upgrades.
+
+# --- Bookkeeping fields that move on every upgrade --------------------------
+# *_timestamp
+# @last_*
+# @*_datetime
+
+# --- Attack signature churn (signature file differs before vs after) --------
+# attack_signatures
+# signature_sets
+# re:<signature_file_
+
+# --- Example: ignore one attribute on one element type ----------------------
+# urls/url@last_learned
