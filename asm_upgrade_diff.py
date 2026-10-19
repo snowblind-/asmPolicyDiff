@@ -378,9 +378,12 @@ class BigIP:
     def download(self, remote_name, dest):
         """Chunked download from /mgmt/tm/asm/file-transfer/downloads/.
 
-        Advances by the bytes actually received (not by what Content-Range claims),
-        never requests past the end of the file, and fails if the final size doesn't
-        match the total the BIG-IP reported. Returns (bytes received, expected total).
+        Advances by the bytes actually received (not by what Content-Range claims).
+        The file size in the response's Content-Range is used only when it is a real
+        size: some versions (seen on 21.1) report a total of 0. Without a usable total
+        the download continues until a chunk comes back short or empty, or the BIG-IP
+        rejects a range past the end. The caller still parses the file afterwards, so a
+        truncated download is caught either way. Returns (bytes received, total or None).
         """
         path = f"/mgmt/tm/asm/file-transfer/downloads/{remote_name}"
         tmp = Path(str(dest) + ".part")
@@ -388,30 +391,42 @@ class BigIP:
         with open(tmp, "wb") as fh:
             while True:
                 end = received + CHUNK_SIZE - 1
-                if total is not None:
+                if total:
                     end = min(end, total - 1)
+                want = end - received + 1
                 headers = {"Content-Type": "application/octet-stream",
                            "Content-Range": f"{received}-{end}/{total or 0}"}
-                r = self.request("GET", path, headers=headers)
+                try:
+                    r = self.request("GET", path, headers=headers)
+                except BigIPError:
+                    if received and not total:
+                        break  # size unknown and we asked past the end: file is complete
+                    raise
                 data = r.content
-                m = re.match(r"\s*(?:bytes\s+)?(\d+)-(\d+)/(\d+)", r.headers.get("Content-Range", ""))
+                cr = r.headers.get("Content-Range", "")
+                LOG.debug("%s: %s requested %s, got %d bytes, Content-Range %r",
+                          self.host, remote_name, headers["Content-Range"], len(data), cr)
+                m = re.match(r"\s*(?:bytes\s+)?(\d+)-(\d+)/(\d+)", cr)
                 if m:
                     rstart, _, rtotal = map(int, m.groups())
-                    if rstart != received:
+                    if rtotal > received and total is None:
+                        total = rtotal  # trust the size only when it is plausible
+                    if total and data and rstart != received:
                         raise BigIPError(f"server sent range starting at byte {rstart}, "
                                          f"expected {received}")
-                    total = rtotal if total is None else total
                 fh.write(data)
                 received += len(data)
-                if not m:
-                    if total is None:  # whole file came back in a single response
-                        total = received
-                    break
-                if received >= total:
-                    break
                 if not data:
-                    raise BigIPError(f"download stalled at {received} of {total} bytes")
-        if total is not None and received != total:
+                    if not received:
+                        raise BigIPError("server returned an empty file")
+                    break
+                if not m:
+                    break  # whole file came back in a single response
+                if total and received >= total:
+                    break
+                if not total and len(data) < want:
+                    break  # short chunk: that was the last one
+        if total and received != total:
             tmp.unlink(missing_ok=True)
             raise BigIPError(f"incomplete download: got {received} of {total} bytes")
         tmp.replace(dest)
