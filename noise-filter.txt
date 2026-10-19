@@ -26,6 +26,7 @@
 # attack_signatures
 # signature_sets
 # re:<signature_file_
+previous_enforced_rule
 
 # --- Example: ignore one attribute on one element type ----------------------
 # urls/url@last_learned

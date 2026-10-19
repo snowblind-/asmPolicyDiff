@@ -920,7 +920,7 @@ def write_report(devices, outdir, opts):
          f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
          f"<title>ASM Upgrade Diff</title><style>{CSS}</style></head><body><main>",
          "<h1>ASM policy upgrade comparison</h1>",
-         f"<div class='muted'>Generated {e(now_iso())} from <code>{e(str(Path(outdir).resolve()))}</code></div>"]
+         f"<div class='muted'>Generated {e(now_iso())} from <code>{e(str(outdir))}</code></div>"]
 
     # ---- overall summary ----
     verdict = ("All devices: policy counts match, no material policy differences, and every "

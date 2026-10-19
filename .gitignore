@@ -9,3 +9,5 @@ report.json
 
 .DS_Store
 .DS_Store
+!docs/sample/report.html
+!docs/sample/report.json
