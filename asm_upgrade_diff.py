@@ -42,22 +42,11 @@ Authentication uses the iControl REST token method:
 
 Output layout (default ./asm_snapshots):
   <outdir>/<device>/pre/manifest.json          version, hostname, policy list, hashes
-  <outdir>/<device>/pre/policies/<policy>.json exported policy (.xml with --format xml)
+  <outdir>/<device>/pre/policies/<policy>.xml  exported policy
   <outdir>/<device>/post/...                   same, after the upgrade
   <outdir>/report.html                         summary + per-policy diffs
   <outdir>/report.json                         machine-readable summary
-  <outdir>/diffs/<device>/<policy>.diff        full unified diff of the normalized policy
-  <outdir>/diffs/<device>/<policy>.changes.json  JSON only: every change as path/before/after
-
-Export format
--------------
-  Policies are exported as JSON (declarative policy) by default and diffed structurally:
-  list entries such as urls, parameters, signatures and violations are matched by their
-  identity (name, signatureId, ...), so reordering is not a change, and each difference is
-  reported as a path like  urls[name=/login, protocol=https].attackSignaturesCheck .
-  --format auto (default) falls back to XML on a device whose JSON export fails;
-  --format json / xml force one. Pre and post must use the same format to be compared.
-  --json-minimal exports only non-default settings (smaller, but hides changed defaults).
+  <outdir>/diffs/<device>/<policy>.diff        full unified diffs
 
 Requires: Python 3.8+, requests  (pip install requests)
 """
@@ -343,8 +332,7 @@ class BigIP:
             pass
         return t
 
-    def export_policy(self, policy_id, remote_name, dest, fmt="json", poll_timeout=600, retries=3,
-                      minimal=False):
+    def export_policy(self, policy_id, remote_name, dest, fmt="xml", poll_timeout=600, retries=3):
         """Export one policy to `dest`, verified complete and well-formed.
 
         Tries the file export + chunked download up to `retries` times, then falls back to
@@ -355,8 +343,6 @@ class BigIP:
                 "policyReference": {"link": f"https://localhost/mgmt/tm/asm/policies/{policy_id}"}}
         if fmt == "json":
             body["format"] = "json"
-            if minimal:
-                body["minimal"] = True
         history = []
 
         for attempt in range(1, retries + 1):
@@ -505,11 +491,10 @@ def export_device(host, args, password):
     pol_dir = devdir / "policies"
     pol_dir.mkdir(parents=True, exist_ok=True)
 
-    fmt = "xml" if args.format == "xml" else "json"
     manifest = {"host": host, "phase": args.phase, "collected_at": now_iso(),
-                "format": fmt, "format_requested": args.format, "json_minimal": args.json_minimal,
-                "hostname": "", "version": {}, "policy_count": None, "policies": [],
-                "errors": [], "notes": []}
+                "format": args.format, "hostname": "", "version": {},
+                "policy_count": None, "policies": [], "errors": []}
+    ext = "json" if args.format == "json" else "xml"
     try:
         with BigIP(host, args.username, password, verify=args.verify_arg,
                    login_provider=args.login_provider, timeout=args.timeout) as bip:
@@ -533,25 +518,12 @@ def export_device(host, args, password):
                 entry = {k: p.get(k) for k in ("id", "name", "fullPath", "type",
                                                 "active", "enforcementMode")}
                 entry.update(file=None, sha256=None, error=None)
+                local = pol_dir / f"{safe_name(full)}.{ext}"
+                remote = f"asmdiff_{args.phase}_{p['id']}.{ext}"
                 try:
-                    LOG.info("%s: [%d/%d] exporting %s (%s)", host, i, len(policies), full, fmt)
-                    try:
-                        local = pol_dir / f"{safe_name(full)}.{fmt}"
-                        info = bip.export_policy(p["id"], f"asmdiff_{args.phase}_{p['id']}.{fmt}",
-                                                 local, fmt=fmt, poll_timeout=args.task_timeout,
-                                                 minimal=args.json_minimal)
-                    except BigIPError as e:
-                        # --format auto: if the very first JSON export fails, assume this
-                        # BIG-IP can't export JSON and switch the whole device to XML.
-                        if not (args.format == "auto" and fmt == "json" and i == 1):
-                            raise
-                        fmt = manifest["format"] = "xml"
-                        msg = f"JSON export failed ({e}); falling back to XML for this device"
-                        manifest["notes"].append(msg)
-                        LOG.warning("%s: %s", host, msg)
-                        local = pol_dir / f"{safe_name(full)}.xml"
-                        info = bip.export_policy(p["id"], f"asmdiff_{args.phase}_{p['id']}.xml",
-                                                 local, fmt="xml", poll_timeout=args.task_timeout)
+                    LOG.info("%s: [%d/%d] exporting %s", host, i, len(policies), full)
+                    info = bip.export_policy(p["id"], remote, local, fmt=args.format,
+                                             poll_timeout=args.task_timeout)
                     entry["file"] = str(local.relative_to(devdir))
                     entry["sha256"] = sha256(local)
                     entry.update(bytes=info["bytes"], export_method=info["method"],
@@ -660,158 +632,42 @@ def canon_xml(path, noise, sort_siblings):
     return lines, {k: "\n".join(v) for k, v in sections.items()}
 
 
-# ---- JSON (declarative policy) structural diff ------------------------------
-# Lists of objects (urls, parameters, signatures, violations, ...) are matched by
-# identity instead of position, so reordering after an upgrade is not a change.
-ID_PRIMARY = ("name", "signatureId", "serverTechnologyName", "description", "id", "key")
-ID_DISCRIMINATORS = ("method", "protocol", "type", "level", "url", "parameterLocation",
-                     "location", "headerType", "valueType")
-
-
-def _idval(v):
-    return v if isinstance(v, str) else json.dumps(v, sort_keys=True, separators=(",", ":"))
-
-
-def list_identity(*lists):
-    """Fields that uniquely identify each object in every given list, or None."""
-    items = [i for lst in lists for i in lst]
-    if not items or not all(isinstance(i, dict) for i in items):
-        return None
-
-    def unique(fields):
-        return all(len({tuple(_idval(i.get(f)) for f in fields) for i in lst}) == len(lst)
-                   for lst in lists)
-
-    for pk in ID_PRIMARY:
-        if all(pk in i for i in items):
-            fields = [pk]
-            if unique(fields):
-                return fields
-            for d in ID_DISCRIMINATORS:
-                if any(d in i for i in items):
-                    fields.append(d)
-                    if unique(fields):
-                        return fields
-            return None
-    return None
-
-
-def json_load_clean(path, noise):
-    """Load a JSON export and drop noise keys (paths are relative to the policy object)."""
+def canon_json(path, noise, sort_lists):
     data = json.loads(Path(path).read_text())
 
     def clean(o, o_path):
         if isinstance(o, dict):
-            return {k: clean(v, f"{o_path}/{k}" if o_path else k) for k, v in o.items()
-                    if not noise.drop_element(k, f"{o_path}/{k}" if o_path else k)}
+            out = {}
+            for k, v in o.items():
+                k_path = f"{o_path}/{k}" if o_path else k
+                if not noise.drop_element(k, k_path):
+                    out[k] = clean(v, k_path)
+            return out
         if isinstance(o, list):
-            return [clean(i, o_path) for i in o]
+            items = [clean(i, o_path) for i in o]
+            if sort_lists:
+                items.sort(key=lambda x: json.dumps(x, sort_keys=True))
+            return items
         return o
 
+    # paths are relative to the policy object, matching the XML convention
     if isinstance(data, dict) and isinstance(data.get("policy"), dict):
-        return {k: clean(v, "" if k == "policy" else k) for k, v in data.items()
-                if k == "policy" or not noise.drop_element(k, k)}
-    return clean(data, "")
+        data = {**data, "policy": clean(data["policy"], "")}
+        data = {k: (v if k == "policy" else clean(v, k)) for k, v in data.items()}
+        pol = data["policy"]
+    else:
+        data = clean(data, "")
+        pol = data if isinstance(data, dict) else {}
+    lines = noise.filter_lines(json.dumps(data, indent=2, sort_keys=True).splitlines())
+    sections = {k: "\n".join(noise.filter_lines(json.dumps(v, indent=2, sort_keys=True).splitlines()))
+                for k, v in pol.items()}
+    return lines, sections
 
 
-def json_canonical(o, keep_order):
-    """Deterministic form for the text diff: keyed lists sorted by identity."""
-    if isinstance(o, dict):
-        return {k: json_canonical(v, keep_order) for k, v in o.items()}
-    if isinstance(o, list):
-        items = [json_canonical(i, keep_order) for i in o]
-        fields = list_identity(items)
-        if fields:
-            return sorted(items, key=lambda i: tuple(str(_idval(i.get(f))) for f in fields))
-        if not keep_order:
-            return sorted(items, key=lambda x: json.dumps(x, sort_keys=True))
-        return items
-    return o
-
-
-def json_changes(a, b, path, keep_order, out):
-    """Append (op, path, before, after) tuples describing how a became b."""
-    if isinstance(a, dict) and isinstance(b, dict):
-        for k in sorted(set(a) | set(b)):
-            p = f"{path}.{k}" if path else k
-            if k not in a:
-                out.append(("added", p, None, b[k]))
-            elif k not in b:
-                out.append(("removed", p, a[k], None))
-            else:
-                json_changes(a[k], b[k], p, keep_order, out)
-    elif isinstance(a, list) and isinstance(b, list):
-        fields = list_identity(a, b)
-        if fields:
-            def key(i):
-                return tuple(_idval(i.get(f)) for f in fields)
-            ma, mb = {key(i): i for i in a}, {key(i): i for i in b}
-            for k in sorted(set(ma) | set(mb), key=lambda t: tuple(map(str, t))):
-                label = ", ".join(f"{f}={v}" for f, v in zip(fields, k) if v not in (None, "null"))
-                p = f"{path}[{label}]"
-                if k not in ma:
-                    out.append(("added", p, None, mb[k]))
-                elif k not in mb:
-                    out.append(("removed", p, ma[k], None))
-                else:
-                    json_changes(ma[k], mb[k], p, keep_order, out)
-        elif keep_order:
-            for idx in range(max(len(a), len(b))):
-                p = f"{path}[{idx}]"
-                if idx >= len(a):
-                    out.append(("added", p, None, b[idx]))
-                elif idx >= len(b):
-                    out.append(("removed", p, a[idx], None))
-                else:
-                    json_changes(a[idx], b[idx], p, keep_order, out)
-        else:  # unkeyed list: compare as a multiset
-            ca = [json.dumps(x, sort_keys=True) for x in a]
-            cb = [json.dumps(x, sort_keys=True) for x in b]
-            rem, add = list(cb), []
-            for s in ca:
-                if s in rem:
-                    rem.remove(s)
-                else:
-                    add.append(s)
-            for s in add:
-                out.append(("removed", f"{path}[]", json.loads(s), None))
-            for s in rem:
-                out.append(("added", f"{path}[]", None, json.loads(s)))
-    elif a != b or type(a) is not type(b):
-        out.append(("changed", path, a, b))
-
-
-def short(v, limit=300):
-    if v is None:
-        return ""
-    s = v if isinstance(v, str) else json.dumps(v, sort_keys=True, separators=(", ", ": "))
-    return s if len(s) <= limit else s[:limit] + " …"
-
-
-def compare_json(pre_path, post_path, opts):
-    noise = opts["noise"]
-    a, b = json_load_clean(pre_path, noise), json_load_clean(post_path, noise)
-    raw = []
-    json_changes(a, b, "", opts["sort"] is False, raw)
-    changes = []
-    for op, path, before, after in raw:
-        disp = path[len("policy."):] if path.startswith("policy.") else path
-        if noise.drop_line(f"{op} {disp}: {short(before, 10**6)} -> {short(after, 10**6)}"):
-            continue
-        section = re.split(r"[.\[]", disp, maxsplit=1)[0] or "(policy)"
-        changes.append({"op": op, "path": disp, "section": section,
-                        "before": before, "after": after})
-    if not changes:
-        return {"status": "cosmetic"}
-    keep = opts["sort"] is False
-    pre_lines = noise.filter_lines(json.dumps(json_canonical(a, keep), indent=2, sort_keys=True).splitlines())
-    post_lines = noise.filter_lines(json.dumps(json_canonical(b, keep), indent=2, sort_keys=True).splitlines())
-    diff = list(difflib.unified_diff(pre_lines, post_lines, "pre-upgrade", "post-upgrade",
-                                     n=opts["context"], lineterm=""))
-    count = lambda op: sum(1 for c in changes if c["op"] == op)  # noqa: E731
-    return {"status": "material", "changes": changes, "diff": diff,
-            "added": count("added"), "removed": count("removed"), "changed": count("changed"),
-            "sections": sorted({c["section"] for c in changes})}
+def canonicalize(path, opts):
+    if str(path).endswith(".json"):
+        return canon_json(path, opts["noise"], opts["sort"])
+    return canon_xml(path, opts["noise"], opts["sort"])
 
 
 def compare_policy(pre_path, post_path, opts):
@@ -825,18 +681,10 @@ def compare_policy(pre_path, post_path, opts):
         return {"status": "error",
                 "error": "; ".join(problems) + ". The file is truncated or corrupt; re-export that "
                          "phase with --force (the script now verifies downloads)."}
-    pre_fmt, post_fmt = Path(pre_path).suffix, Path(post_path).suffix
-    if pre_fmt != post_fmt:
-        return {"status": "error",
-                "error": f"format mismatch: pre-upgrade export is {pre_fmt[1:].upper()}, post-upgrade "
-                         f"is {post_fmt[1:].upper()}. Re-export one phase with --force and a matching "
-                         f"--format so both sides can be compared."}
     if sha256(pre_path) == sha256(post_path):
         return {"status": "identical"}
-    if pre_fmt == ".json":
-        return compare_json(pre_path, post_path, opts)
-    pre_lines, pre_sec = canon_xml(pre_path, opts["noise"], opts["sort"])
-    post_lines, post_sec = canon_xml(post_path, opts["noise"], opts["sort"])
+    pre_lines, pre_sec = canonicalize(pre_path, opts)
+    post_lines, post_sec = canonicalize(post_path, opts)
     if pre_lines == post_lines:
         return {"status": "cosmetic"}
     diff = list(difflib.unified_diff(pre_lines, post_lines, "pre-upgrade",
@@ -935,14 +783,6 @@ def build_results(outdir, opts):
         for m, label in ((pre, "pre"), (post, "post")):
             for err in m.get("errors", []):
                 dev["notes"].append(f"{label}-upgrade: {err}")
-            for note in m.get("notes", []):
-                dev["notes"].append(f"{label}-upgrade: {note}")
-        if pre.get("format", "xml") != post.get("format", "xml"):
-            dev["notes"].append(f"Export format differs: pre-upgrade {pre.get('format', 'xml').upper()}, "
-                                f"post-upgrade {post.get('format', 'xml').upper()}; policies can't be compared.")
-        if pre.get("json_minimal") != post.get("json_minimal") and post.get("format") == "json":
-            dev["notes"].append("One phase used --json-minimal and the other didn't; expect spurious "
-                                "differences in default-valued settings.")
         if pre.get("version") and pre.get("version") == post.get("version"):
             dev["notes"].append("Software version is the same before and after; "
                                 "the upgrade may not have been applied yet.")
@@ -966,10 +806,6 @@ def build_results(outdir, opts):
                 dpath.parent.mkdir(parents=True, exist_ok=True)
                 dpath.write_text("\n".join(row["diff"]) + "\n")
                 row["diff_file"] = str(dpath.relative_to(outdir))
-            if row.get("changes"):
-                cpath = Path(outdir) / "diffs" / devdir.name / f"{safe_name(name)}.changes.json"
-                cpath.write_text(json.dumps(row["changes"], indent=2))
-                row["changes_file"] = str(cpath.relative_to(outdir))
             dev["policies"].append(row)
 
         st = [r["status"] for r in dev["policies"]]
@@ -1052,43 +888,6 @@ def render_diff(lines, limit):
             cls = ""
         out.append(f'<span class="{cls}">{html.escape(l) or " "}</span>')
     return "".join(out)
-
-
-OP_LABEL = {"added": ("Added", "warn"), "removed": ("Removed", "bad"), "changed": ("Changed", "bad")}
-
-
-def change_counts(r):
-    if r.get("changes") is not None:
-        return f"+{r['added']} added / −{r['removed']} removed / ~{r['changed']} changed"
-    return f"+{r['added']} / −{r['removed']} lines"
-
-
-def render_changes(r, limit):
-    """Path / before / after table for a JSON policy, grouped by section."""
-    e = html.escape
-    rows, shown = [], 0
-    for section in r["sections"]:
-        sec = [c for c in r["changes"] if c["section"] == section]
-        rows.append(f"<tr><th colspan='4' style='text-transform:none'>{e(section)} "
-                    f"<span class='muted'>({len(sec)})</span></th></tr>")
-        for c in sec:
-            if shown >= limit:
-                break
-            shown += 1
-            lbl, cls = OP_LABEL[c["op"]]
-            rows.append(f"<tr><td>{pill(lbl, cls)}</td><td><code>{e(c['path'])}</code></td>"
-                        f"<td class='del'><code>{e(short(c['before']))}</code></td>"
-                        f"<td class='add'><code>{e(short(c['after']))}</code></td></tr>")
-    total = len(r["changes"])
-    more = (f"<div class='muted' style='padding:6px 12px'>Showing first {limit} of {total} changes.</div>"
-            if total > limit else "")
-    links = (f"Full detail: <a href='{e(r['changes_file'])}'>{e(r['changes_file'])}</a> · "
-             f"text diff: <a href='{e(r['diff_file'])}'>{e(r['diff_file'])}</a>")
-    return (f"<details open id='{e(r['anchor'])}'><summary>{e(r['name'])} — {e(change_counts(r))}; "
-            f"sections: {e(', '.join(r['sections']))}</summary>"
-            f"<div class='muted' style='padding:0 12px 6px'>{links}</div>{more}"
-            f"<div class='wrap' style='padding:0 12px 12px'><table><tr><th>Change</th><th>Path</th>"
-            f"<th>Before</th><th>After</th></tr>{''.join(rows)}</table></div></details>")
 
 
 def write_report(devices, outdir, opts):
@@ -1187,12 +986,12 @@ def write_report(devices, outdir, opts):
         if d["notes"]:
             h.append("<ul class='notes'>" + "".join(f"<li>{e(n)}</li>" for n in d["notes"]) + "</ul>")
         if d["policies"]:
-            h.append("<div class='wrap'><table><tr><th>Policy</th><th>Result</th><th>Changes</th></tr>")
+            h.append("<div class='wrap'><table><tr><th>Policy</th><th>Result</th><th>+/− lines</th></tr>")
             for r in d["policies"]:
                 lbl, cls = STATUS_LABEL[r["status"]]
                 name = (f"<a href='#{e(r['anchor'])}'>{e(r['name'])}</a>" if r["status"] in ("material", "error")
                         else e(r["name"]))
-                pm = change_counts(r) if r["status"] == "material" else ""
+                pm = f"+{r['added']} / −{r['removed']}" if r["status"] == "material" else ""
                 h.append(f"<tr><td>{name}</td><td>{pill(lbl, cls)}</td><td>{pm}</td></tr>")
             h.append("</table></div>")
         if d["vs_checked"]:
@@ -1216,8 +1015,6 @@ def write_report(devices, outdir, opts):
             if r["status"] == "error":
                 h.append(f"<details open id='{e(r['anchor'])}'><summary>{e(r['name'])} — error</summary>"
                          f"<pre class='diff'><span>{e(r.get('error', ''))}</span></pre></details>")
-            elif r["status"] == "material" and r.get("changes") is not None:
-                h.append(render_changes(r, opts["max_lines"]))
             elif r["status"] == "material":
                 more = ""
                 if len(r["diff"]) > opts["max_lines"]:
@@ -1331,12 +1128,8 @@ def main():
     ex.add_argument("-u", "--username", required=True)
     ex.add_argument("-p", "--password", help="password (else $BIGIP_PASSWORD, else prompt)")
     ex.add_argument("--login-provider", default="tmos", help="loginProviderName (default tmos)")
-    ex.add_argument("--format", choices=["auto", "json", "xml"], default="auto",
-                    help="policy export format (default auto: JSON, falling back to XML on a "
-                         "device whose first JSON export fails)")
-    ex.add_argument("--json-minimal", action="store_true",
-                    help="JSON only: export just the settings that differ from the policy "
-                         "template defaults (smaller files; hides changed defaults)")
+    ex.add_argument("--format", choices=["xml", "json"], default="xml",
+                    help="export format; json needs a BIG-IP version that supports JSON export")
     ex.add_argument("--verify", action="store_true", help="verify TLS certificates")
     ex.add_argument("--ca-bundle", help="CA bundle for TLS verification (implies --verify)")
     ex.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds (default 60)")
