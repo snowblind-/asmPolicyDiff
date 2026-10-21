@@ -165,6 +165,9 @@ class BigIP:
         self.token_timeout = token_timeout
         self.token = None
         self.s = requests.Session()
+        # verify is passed on every call: requests lets REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE
+        # override a session-level verify=False, which re-enables certificate checks.
+        self.verify = verify
         self.s.verify = verify
         self.s.headers.update({"Content-Type": "application/json"})
 
@@ -183,7 +186,7 @@ class BigIP:
                             json={"username": self.username,
                                   "password": self.password,
                                   "loginProviderName": self.login_provider},
-                            timeout=self.timeout)
+                            timeout=self.timeout, verify=self.verify)
         except requests.RequestException as e:
             raise BigIPError(f"cannot reach {self.host}: {e}") from e
         if r.status_code != 200:
@@ -196,7 +199,8 @@ class BigIP:
         # Default token life is 1200s; extend so large exports don't expire mid-run.
         try:
             self.s.patch(f"{self.base}/mgmt/shared/authz/tokens/{self.token}",
-                         json={"timeout": self.token_timeout}, timeout=self.timeout)
+                         json={"timeout": self.token_timeout}, timeout=self.timeout,
+                         verify=self.verify)
         except requests.RequestException:
             LOG.debug("%s: could not extend token timeout", self.host)
 
@@ -204,7 +208,7 @@ class BigIP:
         if self.token:
             try:
                 self.s.delete(f"{self.base}/mgmt/shared/authz/tokens/{self.token}",
-                              timeout=self.timeout)
+                              timeout=self.timeout, verify=self.verify)
             except requests.RequestException:
                 pass
             self.token = None
@@ -212,6 +216,7 @@ class BigIP:
     # -- requests -----------------------------------------------------------
     def request(self, method, path, retry_auth=True, **kw):
         kw.setdefault("timeout", self.timeout)
+        kw.setdefault("verify", self.verify)
         try:
             r = self.s.request(method, self.base + path, **kw)
         except requests.RequestException as e:
